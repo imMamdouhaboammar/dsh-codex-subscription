@@ -187,7 +187,7 @@ test('plugin activates without the web connection service in Headless mode', () 
   const host = fakeContext({ connection: false })
 
   assert.doesNotThrow(() => applyPlugin(host.ctx))
-  assert.deepEqual(host.registered.map(item => item.providers), [['openai-codex']])
+  assert.deepEqual(host.registered.map(item => item.providers), [['openai-codex', 'codex-oauth']])
   assert.equal(host.handled.length, 0)
 })
 
@@ -196,7 +196,7 @@ test('plugin registers one Codex route, subscription image tool, and DSH-trusted
   applyPlugin(host.ctx)
 
   assert.equal('CODEX_PROVIDER_POLICY' in plugin, false, 'do not replace the removed boundary with cosmetic metadata')
-  assert.deepEqual(host.registered.map(item => item.providers), [['openai-codex']])
+  assert.deepEqual(host.registered.map(item => item.providers), [['openai-codex', 'codex-oauth']])
   const profile = host.registered[0].adapter.current().profiles.get('openai-codex')
   assert.deepEqual({
     maxRequestImageBytes: profile.maxRequestImageBytes,
