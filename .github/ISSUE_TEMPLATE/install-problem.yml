@@ -1,0 +1,117 @@
+name: Bug report
+description: Report a reproducible installation, sign-in, model, quota, image, update, or uninstall problem
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include tokens, cookies, OAuth URLs, authorization codes, or other credentials.
+        If Settings opens, generate a Support diagnostics report first; it excludes credentials and account identifiers.
+
+  - type: dropdown
+    id: system
+    attributes:
+      label: System
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: dsh_mode
+    attributes:
+      label: DSH setup
+      options:
+        - Official DSH installation
+        - DSH-Portable
+        - npm / npx
+        - From source
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: plugin_version
+    attributes:
+      label: Plugin version
+      description: Copy the exact version from Settings or the plugin list. Enter "not installed" if setup did not finish.
+    validations:
+      required: true
+
+  - type: input
+    id: dsh_version
+    attributes:
+      label: DSH version
+      description: Copy the exact version from About, startup output, or the package manager.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Failing area
+      options:
+        - Install or update
+        - Browser sign-in or cancel
+        - Models, effort, or Fast mode
+        - Search
+        - Quota display or reset
+        - Image generation or editing
+        - Image preview or download
+        - Support diagnostics
+        - Uninstall
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: List the smallest sequence that reproduces the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Support diagnostics
+      description: Paste the report generated in Settings, or write "unavailable" and explain why. Do not paste full raw logs, secrets, or authorization links.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Other error output
+      description: Paste any additional setup, terminal, or DSH error after removing credentials and authorization links.
+      render: shell
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked that this report contains no tokens, cookies, OAuth URLs, authorization codes, or other credentials.
+          required: true
+        - label: I provided the exact DSH and plugin versions, or stated that the plugin is not installed.
+          required: true

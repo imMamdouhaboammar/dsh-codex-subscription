@@ -1,0 +1,116 @@
+import assert from 'node:assert/strict'
+import { existsSync, readFileSync } from 'node:fs'
+import test from 'node:test'
+
+const releaseWorkflow = readFileSync(new URL('../.github/workflows/publish.yml', import.meta.url), 'utf8')
+
+test('GitHub Releases include beginner-facing install, update, and uninstall instructions before publish', () => {
+  assert.match(releaseWorkflow, /<!-- dsh-codex-install -->/u)
+  assert.match(releaseWorkflow, /## Installation[\s\S]*## 中文[\s\S]*## 安装/u)
+  assert.match(releaseWorkflow, /### Standard DSH command[\s\S]*### DSH 标准命令/u)
+  assert.match(releaseWorkflow, /dsh plugin --profile web add dsh-codex-subscription/u)
+  assert.match(releaseWorkflow, /npx -y @deepseek-ai\/dsh@__DSH_VERSION__ plugin --profile web add dsh-codex-subscription/u)
+  assert.doesNotMatch(releaseWorkflow, /\birm\b|dsh-codex-setup\.ps1/iu)
+  assert.match(releaseWorkflow, /dsh@__DSH_VERSION__ plugin --profile web remove dsh-codex-subscription/u)
+  assert.match(releaseWorkflow, /sed -i "s\/__DSH_VERSION__\/\$current_dsh\/g" \.release\/install\.md/u)
+  assert.match(releaseWorkflow, /release_kind:[\s\S]*compatibility/u)
+  assert.match(releaseWorkflow, /Added support for DeepSeek Harness/u)
+  assert.match(releaseWorkflow, /compatibility\.previews/u)
+  assert.match(releaseWorkflow, /current_dsh="\$REQUESTED_DSH_VERSION"/u)
+  assert.match(releaseWorkflow, /Added compatibility with DeepSeek Harness/u)
+  assert.match(releaseWorkflow, /新增对 DeepSeek Harness/u)
+  assert.equal(existsSync(new URL('../.github/workflows/release-notes.yml', import.meta.url)), false)
+})
+
+test('GitHub Release notes stay user-facing and exclude internal maintenance evidence', () => {
+  const notesStart = releaseWorkflow.indexOf('- name: Prepare beginner-facing release notes')
+  const notesEnd = releaseWorkflow.indexOf('- name: Build immutable release assets')
+  assert.ok(notesStart >= 0 && notesEnd > notesStart, 'publish workflow must define a bounded release-notes step')
+  const notesStep = releaseWorkflow.slice(notesStart, notesEnd)
+  assert.doesNotMatch(
+    notesStep,
+    /GitHub Actions|每\s*6\s*小时|every six hours|隔离验收|isolated .*acceptance|smoke acceptance|fail[- ]closed|自动兼容|compatibility autopilot/iu,
+  )
+  assert.match(notesStep, /Added support for DeepSeek Harness/u)
+  assert.doesNotMatch(notesStep, /Fixed `codex_image_generate` for large Base64 PNG/u)
+  assert.match(releaseWorkflow, /release_notes_en:[\s\S]*English user-facing release summary/u)
+  assert.match(releaseWorkflow, /release_notes_zh:[\s\S]*Chinese user-facing release summary/u)
+  assert.match(notesStep, /Feature and bugfix releases require explicit bilingual release notes/u)
+  assert.match(notesStep, /beta_notes_en="\$RELEASE_NOTES_EN"/u)
+  assert.match(notesStep, /beta_notes_zh="\$RELEASE_NOTES_ZH"/u)
+  assert.doesNotMatch(notesStep, /Switch supported Codex models between Standard and Fast|输入框支持为兼容的 Codex 模型切换标准或高速/u)
+  assert.match(notesStep, /## Install or update the Beta[\s\S]*dsh-codex-subscription@\$RELEASE_VERSION/u)
+  assert.match(notesStep, /## 安装或更新 Beta[\s\S]*dsh-codex-subscription@\$RELEASE_VERSION/u)
+  assert.match(
+    notesStep,
+    /if \[\[ "\$RELEASE_NOTES_EN" == \*'\\n'\* \|\| "\$RELEASE_NOTES_ZH" == \*'\\n'\* \]\]; then/u,
+  )
+  assert.match(notesStep, /real line breaks, not literal/u)
+  const validationStart = notesStep.indexOf("if [[ \"${RELEASE_KIND:-feature}\" != 'compatibility' ]]")
+  const prereleaseStart = notesStep.indexOf('if [[ "$IS_PRERELEASE" == \'true\' ]]')
+  assert.ok(validationStart >= 0 && prereleaseStart > validationStart, 'bilingual note validation must precede prerelease branching')
+})
+
+test('release lifecycle commands keep update and uninstall in separate sections', () => {
+  const notesStart = releaseWorkflow.indexOf('- name: Prepare beginner-facing release notes')
+  const notesEnd = releaseWorkflow.indexOf('- name: Build immutable release assets')
+  const notesStep = releaseWorkflow.slice(notesStart, notesEnd)
+  for (const [updateHeading, uninstallHeading, updateCommand, uninstallCommand] of [
+    ['### Update', '### Uninstall', 'npx -y @deepseek-ai/dsh@__DSH_VERSION__ plugin --profile web update dsh-codex-subscription', 'npx -y @deepseek-ai/dsh@__DSH_VERSION__ plugin --profile web remove dsh-codex-subscription'],
+    ['### 更新', '### 卸载', 'npx -y @deepseek-ai/dsh@__DSH_VERSION__ plugin --profile web update dsh-codex-subscription', 'npx -y @deepseek-ai/dsh@__DSH_VERSION__ plugin --profile web remove dsh-codex-subscription'],
+  ]) {
+    const updateStart = notesStep.indexOf(updateHeading)
+    const uninstallStart = notesStep.indexOf(uninstallHeading, updateStart + updateHeading.length)
+    assert.ok(updateStart >= 0 && uninstallStart > updateStart, `${updateHeading} must precede ${uninstallHeading}`)
+    const updateSection = notesStep.slice(updateStart, uninstallStart)
+    const uninstallSection = notesStep.slice(uninstallStart)
+    assert.match(updateSection, new RegExp(updateCommand.replaceAll(/[.*+?^${}()|[\]\\]/gu, '\\$&')))
+    assert.doesNotMatch(updateSection, /plugin --profile web remove dsh-codex-subscription/u)
+    assert.match(uninstallSection, new RegExp(uninstallCommand.replaceAll(/[.*+?^${}()|[\]\\]/gu, '\\$&')))
+  }
+  assert.doesNotMatch(notesStep, /list dsh-codex-subscription|--dump-config/u)
+})
+
+test('feature releases credit merged contributor PRs with verified authors and links', () => {
+  assert.match(releaseWorkflow, /contributor_prs:[\s\S]*merged contributor PR numbers/iu)
+  assert.match(releaseWorkflow, /CONTRIBUTOR_PRS: \$\{\{ inputs\.contributor_prs \}\}/u)
+  assert.match(releaseWorkflow, /gh pr view "\$pr_number"[\s\S]*author,mergedAt,number,url/u)
+  assert.match(releaseWorkflow, /test "\$merged_at" != 'null'/u)
+  assert.match(releaseWorkflow, /Thanks to \[@\$author\][\s\S]*for contributing in \[#\$number\]/u)
+})
+
+test('releases credit merged PR contributors but never turn issue reports into release credits', () => {
+  assert.doesNotMatch(releaseWorkflow, /reported_issues|REPORTED_ISSUES|prepare_reporters|append_reporters|Issue reporters/iu)
+})
+
+test('release notes present complete English before a separate Chinese translation', () => {
+  const notesStart = releaseWorkflow.indexOf('- name: Prepare beginner-facing release notes')
+  const notesEnd = releaseWorkflow.indexOf('- name: Build immutable release assets')
+  const notesStep = releaseWorkflow.slice(notesStart, notesEnd)
+
+  assert.match(notesStep, /## What's new[\s\S]*## Installation[\s\S]*## 中文[\s\S]*## 更新内容[\s\S]*## 安装/u)
+  assert.doesNotMatch(notesStep, /^## .* \/ .*$/mu)
+  assert.doesNotMatch(notesStep, /提交贡献 \/ Thanks to/u)
+})
+
+test('immutable releases are drafted, verified with the package and optional manager assets, then published', () => {
+  assert.match(releaseWorkflow, /Create draft GitHub Release/u)
+  assert.match(releaseWorkflow, /gh release create "\$RELEASE_TAG"/u)
+  assert.match(releaseWorkflow, /--draft/u)
+  assert.match(releaseWorkflow, /--title "\$RELEASE_TAG"/u)
+  assert.match(releaseWorkflow, /--target "\$TARGET_SHA"/u)
+  assert.match(releaseWorkflow, /--notes-file \.release\/install\.md/u)
+  assert.doesNotMatch(releaseWorkflow, /--generate-notes/u)
+  assert.match(releaseWorkflow, /Upload draft release assets/u)
+  assert.match(releaseWorkflow, /gh release upload "\$RELEASE_TAG"/u)
+  for (const asset of [
+    'dsh-codex-subscription.tgz',
+    'dsh-codex.ps1',
+    'dsh-codex.ps1.sha256',
+  ]) assert.match(releaseWorkflow, new RegExp(asset.replaceAll('.', '\\.')))
+  assert.match(releaseWorkflow, /Verify draft release before publish/u)
+  assert.match(releaseWorkflow, /gh release view "\$RELEASE_TAG"[\s\S]*isDraft[\s\S]*assets/u)
+  assert.match(releaseWorkflow, /Publish immutable GitHub Release/u)
+  assert.match(releaseWorkflow, /gh release edit "\$RELEASE_TAG"[\s\S]*--draft=false/u)
+  assert.match(releaseWorkflow, /gh release delete[\s\S]*--cleanup-tag/u)
+})

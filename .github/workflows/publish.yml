@@ -1,0 +1,669 @@
+name: Release and publish
+run-name: Release ${{ inputs.request_id || github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: Optional correlation id used by the compatibility autopilot
+        required: false
+        type: string
+      release_kind:
+        description: Release-note template
+        required: false
+        default: feature
+        type: choice
+        options: [feature, bugfix, compatibility]
+      dsh_version:
+        description: Exact accepted DSH version for a compatibility release
+        required: false
+        type: string
+      contributor_prs:
+        description: Comma-separated merged contributor PR numbers to credit
+        required: false
+        type: string
+      release_notes_en:
+        description: English user-facing release summary (required for feature and bugfix releases)
+        required: false
+        type: string
+      release_notes_zh:
+        description: Chinese user-facing release summary (required for feature and bugfix releases)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      npm_tag: ${{ steps.version.outputs.npm_tag }}
+      needed: ${{ steps.existing.outputs.needed }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Require the main branch
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" != 'refs/heads/main' ]]; then
+            echo 'Releases can only be published from main.' >&2
+            exit 1
+          fi
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$ ]]; then
+            echo "Invalid package version: $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "npm_tag=beta" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "npm_tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check whether release already exists
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft >/tmp/release.json 2>/dev/null; then
+            if [[ "$(jq -r '.isDraft' /tmp/release.json)" == "true" ]]; then
+              echo "$RELEASE_TAG is a stale draft and will be rebuilt by the release job."
+              echo "needed=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$RELEASE_TAG is already published; immutable assets will not be replaced."
+              echo "needed=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            if tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq '.sha' 2>/dev/null)"; then
+              if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+                echo "$RELEASE_TAG already points to $tag_sha instead of $GITHUB_SHA." >&2
+                exit 1
+              fi
+            fi
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  verify:
+    needs: preflight
+    if: needs.preflight.outputs.needed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 11.19.0
+          run_install: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm test
+      - run: pnpm run build
+      - name: Verify committed build output
+        run: git diff --exit-code -- lib
+      - name: Pack candidate for official acceptance
+        run: |
+          mkdir -p .candidate
+          pnpm pack --pack-destination .candidate
+          package="$(find .candidate -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          test -n "$package"
+          test -s "$package"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-candidate-${{ github.sha }}
+          path: .candidate/*.tgz
+          if-no-files-found: error
+          include-hidden-files: true
+
+  windows:
+    needs: preflight
+    if: needs.preflight.outputs.needed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Verify optional Windows manager compatibility
+        shell: powershell
+        run: node --test tests/powershell-manager.test.mjs
+        env:
+          DSH_CODEX_TEST_USER_PATH: '1'
+
+  official-acceptance:
+    name: Official DSH end-to-end acceptance
+    needs: [preflight, verify]
+    if: needs.preflight.outputs.needed == 'true' && needs.verify.result == 'success'
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 11.19.0
+          run_install: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-candidate-${{ github.sha }}
+          path: .candidate
+      - name: Official DSH end-to-end acceptance
+        shell: powershell
+        run: |
+          $package = (Get-ChildItem -LiteralPath .candidate -Filter '*.tgz' -File | Select-Object -First 1).FullName
+          if (-not $package) { throw 'Candidate package artifact was not downloaded.' }
+          .\.github\scripts\accept-official-release.ps1 -PackagePath $package -DshRunner pnpm
+
+  release:
+    needs: [preflight, verify, windows, official-acceptance]
+    if: needs.preflight.outputs.needed == 'true' && needs.verify.result == 'success' && needs.windows.result == 'success' && needs.official-acceptance.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 11.19.0
+          run_install: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-candidate-${{ github.sha }}
+          path: .candidate
+
+      - name: Remove stale draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        shell: bash
+        run: |
+          if [[ "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null || true)" == "true" ]]; then
+            gh release delete "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag -y
+          fi
+
+      - name: Prepare beginner-facing release notes
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          IS_PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+          RELEASE_KIND: ${{ inputs.release_kind }}
+          REQUESTED_DSH_VERSION: ${{ inputs.dsh_version }}
+          CONTRIBUTOR_PRS: ${{ inputs.contributor_prs }}
+          RELEASE_NOTES_EN: ${{ inputs.release_notes_en }}
+          RELEASE_NOTES_ZH: ${{ inputs.release_notes_zh }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .release
+          current_dsh="$(node -p "require('./compatibility.json').latestTested")"
+          prepare_contributors() {
+            : > .release/contributors.en.md
+            : > .release/contributors.zh-CN.md
+            [[ -z "${CONTRIBUTOR_PRS:-}" ]] && return 0
+            local raw_pr pr_number pr_json merged_at author number url
+            IFS=',' read -ra contributor_pr_numbers <<< "$CONTRIBUTOR_PRS"
+            for raw_pr in "${contributor_pr_numbers[@]}"; do
+              pr_number="$(xargs <<< "$raw_pr")"
+              [[ "$pr_number" =~ ^[1-9][0-9]*$ ]] || {
+                echo "Invalid contributor PR number: $raw_pr" >&2
+                return 1
+              }
+              pr_json="$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" --json author,mergedAt,number,url)"
+              merged_at="$(jq -r '.mergedAt' <<< "$pr_json")"
+              test "$merged_at" != 'null'
+              author="$(jq -r '.author.login' <<< "$pr_json")"
+              number="$(jq -r '.number' <<< "$pr_json")"
+              url="$(jq -r '.url' <<< "$pr_json")"
+              cat >> .release/contributors.en.md <<NOTES
+          - Thanks to [@$author](https://github.com/$author) for contributing in [#$number]($url).
+          NOTES
+              cat >> .release/contributors.zh-CN.md <<NOTES
+          - 感谢 [@$author](https://github.com/$author) 在 [#$number]($url) 提交贡献。
+          NOTES
+            done
+          }
+          append_contributors() {
+            local language="$1" heading file
+            if [[ "$language" == 'en' ]]; then
+              heading='Contributors'
+              file=.release/contributors.en.md
+            else
+              heading='贡献者'
+              file=.release/contributors.zh-CN.md
+            fi
+            [[ -s "$file" ]] || return 0
+            printf '\n## %s\n\n' "$heading" >> .release/install.md
+            cat "$file" >> .release/install.md
+          }
+          prepare_contributors
+          if [[ "${RELEASE_KIND:-feature}" == 'compatibility' ]]; then
+            test -n "${REQUESTED_DSH_VERSION:-}"
+            node --input-type=module -e '
+              import compatibility from "./compatibility.json" with { type: "json" };
+              const accepted = [...compatibility.supported, ...compatibility.previews];
+              if (!accepted.includes(process.argv[1])) process.exit(1);
+            ' "$REQUESTED_DSH_VERSION"
+            current_dsh="$REQUESTED_DSH_VERSION"
+          fi
+          if [[ "${RELEASE_KIND:-feature}" != 'compatibility' ]]; then
+            # Feature and bugfix releases require explicit bilingual release notes,
+            # including prereleases. Compatibility releases generate their notes below.
+            test -n "${RELEASE_NOTES_EN:-}"
+            test -n "${RELEASE_NOTES_ZH:-}"
+            if [[ "$RELEASE_NOTES_EN" == *'\n'* || "$RELEASE_NOTES_ZH" == *'\n'* ]]; then
+              echo 'Release notes must contain real line breaks, not literal \n sequences.' >&2
+              exit 1
+            fi
+          fi
+          if [[ "$IS_PRERELEASE" == 'true' ]]; then
+            if [[ "${RELEASE_KIND:-feature}" == 'compatibility' ]]; then
+              beta_notes_en="$(printf '%s\n%s' \
+                "- Added compatibility with DeepSeek Harness \`$current_dsh\`." \
+                '- Stable installation guidance remains unchanged.')"
+              beta_notes_zh="$(printf '%s\n%s' \
+                "- 新增对 DeepSeek Harness \`$current_dsh\` 的兼容支持。" \
+                '- 稳定版安装说明保持不变。')"
+            else
+              beta_notes_en="$RELEASE_NOTES_EN"
+              beta_notes_zh="$RELEASE_NOTES_ZH"
+            fi
+            cat > .release/install.md <<NOTES
+          ## Beta preview
+
+          $beta_notes_en
+
+          <!-- dsh-codex-install -->
+          ## Install or update the Beta
+
+          \`\`\`sh
+          npx -y @deepseek-ai/dsh@$current_dsh plugin --profile web add dsh-codex-subscription@$RELEASE_VERSION
+          \`\`\`
+
+          Restart DSH manually. This Beta does not replace npm's stable tag.
+
+          Use this exact-version command for both installation and update. See the [English README](https://github.com/WSL043/dsh-codex-subscription/blob/main/README.en.md) for complete use and uninstall instructions.
+
+          ## Uninstall
+
+          \`\`\`sh
+          npx -y @deepseek-ai/dsh@$current_dsh plugin --profile web remove dsh-codex-subscription
+          \`\`\`
+          NOTES
+            append_contributors en
+            cat >> .release/install.md <<NOTES
+
+          ## 中文
+
+          ## Beta 更新
+
+          $beta_notes_zh
+
+          ## 安装或更新 Beta
+
+          \`\`\`sh
+          npx -y @deepseek-ai/dsh@$current_dsh plugin --profile web add dsh-codex-subscription@$RELEASE_VERSION
+          \`\`\`
+
+          安装后手动重启 DSH。Beta 不会替换 npm 的稳定版标签。
+
+          这条精确版本命令同时用于安装和更新。完整的使用和卸载说明见[中文 README](https://github.com/WSL043/dsh-codex-subscription/blob/main/README.md)。
+
+          ## 卸载
+
+          \`\`\`sh
+          npx -y @deepseek-ai/dsh@$current_dsh plugin --profile web remove dsh-codex-subscription
+          \`\`\`
+          NOTES
+            append_contributors zh-CN
+            exit 0
+          fi
+          if [[ "${RELEASE_KIND:-feature}" == 'compatibility' ]]; then
+            cat > .release/install.md <<NOTES
+          ## DSH compatibility
+
+          - Added support for DeepSeek Harness \`$current_dsh\`.
+          - Supports install, update, and uninstall in official DSH Web.
+
+          NOTES
+          else
+            cat > .release/install.md <<'NOTES'
+          ## What's new
+          NOTES
+            printf '\n%s\n' "$RELEASE_NOTES_EN" >> .release/install.md
+          fi
+          append_contributors en
+          cat >> .release/install.md <<'NOTES'
+
+          <!-- dsh-codex-install -->
+          ## Installation
+
+          ### Standard DSH command
+
+          ```sh
+          dsh plugin --profile web add dsh-codex-subscription
+          ```
+
+          ### Official npm route when `dsh` is not installed globally
+
+          ```sh
+          npx -y @deepseek-ai/dsh@__DSH_VERSION__ plugin --profile web add dsh-codex-subscription
+          ```
+
+          Restart DSH manually after installation.
+
+          ### Update
+
+          ```sh
+          npx -y @deepseek-ai/dsh@__DSH_VERSION__ plugin --profile web update dsh-codex-subscription
+          ```
+
+          See the [English README](https://github.com/WSL043/dsh-codex-subscription/blob/main/README.en.md) for complete use and uninstall instructions.
+
+          ### Uninstall
+
+          ```sh
+          npx -y @deepseek-ai/dsh@__DSH_VERSION__ plugin --profile web remove dsh-codex-subscription
+          ```
+          NOTES
+          cat >> .release/install.md <<'NOTES'
+
+          ## 中文
+          NOTES
+          if [[ "${RELEASE_KIND:-feature}" == 'compatibility' ]]; then
+            cat >> .release/install.md <<NOTES
+
+          ## DSH 兼容更新
+
+          - 已支持 DeepSeek Harness \`$current_dsh\`。
+          - 支持在官方 DSH Web 中安装、更新和卸载。
+          NOTES
+          else
+            cat >> .release/install.md <<'NOTES'
+
+          ## 更新内容
+          NOTES
+            printf '\n%s\n' "$RELEASE_NOTES_ZH" >> .release/install.md
+          fi
+          append_contributors zh-CN
+          cat >> .release/install.md <<'NOTES'
+
+          ## 安装
+
+          ### DSH 标准命令
+
+          ```sh
+          dsh plugin --profile web add dsh-codex-subscription
+          ```
+
+          ### 未全局安装 `dsh` 时的官方 npm 方式
+
+          ```sh
+          npx -y @deepseek-ai/dsh@__DSH_VERSION__ plugin --profile web add dsh-codex-subscription
+          ```
+
+          安装后手动重启 DSH。
+
+          ### 更新
+
+          ```sh
+          npx -y @deepseek-ai/dsh@__DSH_VERSION__ plugin --profile web update dsh-codex-subscription
+          ```
+
+          完整的使用和卸载说明见[中文 README](https://github.com/WSL043/dsh-codex-subscription/blob/main/README.md)。
+
+          ### 卸载
+
+          ```sh
+          npx -y @deepseek-ai/dsh@__DSH_VERSION__ plugin --profile web remove dsh-codex-subscription
+          ```
+          NOTES
+          sed -i "s/__DSH_VERSION__/$current_dsh/g" .release/install.md
+
+      - name: Build immutable release assets
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          IS_PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+        shell: bash
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm run build
+          git diff --exit-code -- lib
+          rm -rf .artifacts
+          mkdir -p .artifacts
+          package="$(find .candidate -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          test -n "$package"
+          cp "$package" .artifacts/dsh-codex-subscription.tgz
+          test -s .artifacts/dsh-codex-subscription.tgz
+          if [[ "$IS_PRERELEASE" != 'true' ]]; then
+            cp dsh-codex.ps1 .artifacts/dsh-codex.ps1
+            (cd .artifacts && sha256sum dsh-codex.ps1 > dsh-codex.ps1.sha256)
+            for asset in dsh-codex.ps1 dsh-codex.ps1.sha256; do
+              test -s ".artifacts/$asset"
+            done
+          fi
+          tar -xOf .artifacts/dsh-codex-subscription.tgz package/package.json \
+            | jq -e --arg version "$RELEASE_VERSION" '.version == $version' >/dev/null
+
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          TARGET_SHA: ${{ github.sha }}
+          IS_PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+        shell: bash
+        run: |
+          flags=()
+          if [[ "$IS_PRERELEASE" == 'true' ]]; then flags+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$TARGET_SHA" \
+            --title "$RELEASE_TAG" \
+            --notes-file .release/install.md \
+            --draft "${flags[@]}"
+
+      - name: Upload draft release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        shell: bash
+        run: |
+          gh release upload "$RELEASE_TAG" .artifacts/* --repo "$GITHUB_REPOSITORY"
+
+      - name: Verify draft release before publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          IS_PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+        shell: bash
+        run: |
+          gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease,body,assets > .release/draft.json
+          jq -e '.isDraft == true' .release/draft.json >/dev/null
+          jq -e --argjson prerelease "$IS_PRERELEASE" '.isPrerelease == $prerelease' .release/draft.json >/dev/null
+          jq -r '.body' .release/draft.json | grep -Fq '<!-- dsh-codex-install -->'
+          expected=1
+          assets=(dsh-codex-subscription.tgz)
+          if [[ "$IS_PRERELEASE" != 'true' ]]; then
+            expected=3
+            assets+=(dsh-codex.ps1 dsh-codex.ps1.sha256)
+          fi
+          jq -e --argjson expected "$expected" '.assets | length == $expected' .release/draft.json >/dev/null
+          for asset in "${assets[@]}"; do
+            jq -e --arg name "$asset" '.assets | any(.name == $name and .size > 0)' \
+              .release/draft.json >/dev/null
+          done
+
+      - name: Publish immutable GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          IS_PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+        shell: bash
+        run: |
+          if [[ "$IS_PRERELEASE" == 'true' ]]; then
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
+          else
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          fi
+
+      - name: Cleanup failed draft
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        shell: bash
+        run: |
+          if [[ "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null || true)" == "true" ]]; then
+            gh release delete "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag -y
+          fi
+
+  publish-npm:
+    needs: [preflight, release]
+    if: >-
+      always() &&
+      needs.preflight.result == 'success' &&
+      (needs.preflight.outputs.needed == 'false' || needs.release.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 11.19.0
+          run_install: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Use an OIDC-capable npm CLI
+        run: npm install --global npm@12.0.2
+
+      - name: Verify release version
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs'
+          const tag = process.env.RELEASE_TAG
+          const { version } = JSON.parse(readFileSync('package.json', 'utf8'))
+          if (!/^v\d+\.\d+\.\d+(?:-beta\.\d+)?$/.test(tag) || tag !== `v${version}`) {
+            throw new Error(`Release tag ${tag} does not match package version ${version}.`)
+          }
+          NODE
+
+      - name: Verify immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          IS_PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+        run: |
+          assets="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          required=(dsh-codex-subscription.tgz)
+          if [[ "$IS_PRERELEASE" != 'true' ]]; then
+            required+=(dsh-codex.ps1 dsh-codex.ps1.sha256)
+          fi
+          for asset in "${required[@]}"
+          do
+            grep -Fxq "$asset" <<<"$assets" || {
+              echo "Missing release asset: $asset" >&2
+              exit 1
+            }
+          done
+
+      - name: Download the accepted package artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          mkdir -p .release-artifact
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern dsh-codex-subscription.tgz --dir .release-artifact
+
+      - name: Verify accepted package metadata
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          tar -xOf .release-artifact/dsh-codex-subscription.tgz package/package.json > .release-artifact/package.json
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs'
+          const expected = JSON.parse(readFileSync('package.json', 'utf8'))
+          const actual = JSON.parse(readFileSync('.release-artifact/package.json', 'utf8'))
+          if (actual.name !== expected.name || actual.version !== expected.version) {
+            throw new Error(`Release package is ${actual.name}@${actual.version}; expected ${expected.name}@${expected.version}.`)
+          }
+          if (process.env.RELEASE_TAG !== `v${actual.version}`) {
+            throw new Error(`Release tag ${process.env.RELEASE_TAG} does not match accepted package ${actual.version}.`)
+          }
+          NODE
+
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm test
+      - run: pnpm run build
+
+      - name: Verify committed build output
+        run: git diff --exit-code -- lib
+
+      - name: Check whether npm version already exists
+        id: npm-version
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if npm view "dsh-codex-subscription@$version" version >/dev/null 2>&1; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "dsh-codex-subscription@$version is already published; skipping duplicate npm publish."
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish with npm Trusted Publishing
+        if: steps.npm-version.outputs.needed == 'true'
+        env:
+          NPM_TAG: ${{ needs.preflight.outputs.npm_tag }}
+        run: npm publish ./.release-artifact/dsh-codex-subscription.tgz --access public --tag "$NPM_TAG"

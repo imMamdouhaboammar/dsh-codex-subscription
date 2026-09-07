@@ -1,0 +1,215 @@
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import test from 'node:test'
+
+import {
+  CODEX_SEARCH_PROVIDER_ID,
+  CODEX_SEARCH_URL,
+  createCodexAutoSearchProvider,
+  createCodexSearchProvider,
+} from '../src/codex-search.js'
+
+test('automatic search routes Codex sessions to subscription and other sessions to DSH', async () => {
+  const calls = []
+  let modelProvider = 'openai-codex'
+  const auto = createCodexAutoSearchProvider({
+    codex: { async search(request) { calls.push(['codex', request.query]); return { sources: [{ url: 'https://codex.example', title: 'Codex' }], truncated: false } } },
+    resolveModelProvider: () => modelProvider,
+    resolveDshProvider: () => ({ id: 'deepseek-official', available: () => true, async search(request) { calls.push(['dsh', request.query]); return { sources: [{ url: 'https://dsh.example', title: 'DSH' }], truncated: false } } }),
+  })
+  assert.equal((await auto.search({ query: 'one' })).sources[0].title, 'Codex')
+  modelProvider = 'deepseek-official'
+  assert.equal((await auto.search({ query: 'two' })).sources[0].title, 'DSH')
+  assert.deepEqual(calls, [['codex', 'one'], ['dsh', 'two']])
+})
+
+test('automatic search fails closed when the DSH route is unavailable', async () => {
+  const auto = createCodexAutoSearchProvider({
+    codex: { async search() { throw new Error('not used') } },
+    resolveModelProvider: () => 'another-provider',
+    resolveDshProvider: () => undefined,
+  })
+  await assert.rejects(auto.search({ query: 'test' }), error => error?.code === 'WEB_PROVIDER_UNAVAILABLE')
+})
+
+test('Codex search uses refreshed subscription OAuth and returns structured citeable sources', async () => {
+  const requests = []
+  const signal = new AbortController().signal
+  const provider = createCodexSearchProvider({
+    async getAuth(options) {
+      assert.equal(options.signal, signal)
+      return { auth: { apiKey: 'access-secret' } }
+    },
+    async readCredential(options) {
+      assert.equal(options.signal, signal)
+      return { type: 'oauth', accountId: 'account-local' }
+    },
+    resolveModel: () => 'gpt-5.6-luna',
+    resolveSessionId: () => 'session-local',
+    async fetch(url, init) {
+      requests.push({ url, init })
+      return new Response(JSON.stringify({
+        output: 'Current answer.',
+        results: [
+          {
+            type: 'text_result',
+            ref_id: 'turn0search0',
+            url: 'https://example.com/one',
+            title: 'First result',
+            snippet: 'Relevant excerpt.',
+            published_at: '2026-08-16',
+          },
+        ],
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    },
+  })
+
+  assert.equal(provider.id, CODEX_SEARCH_PROVIDER_ID)
+  assert.equal(provider.available(), true)
+  assert.deepEqual(await provider.search({ query: 'current result', maxResults: 8 }, signal), {
+    sources: [{
+      url: 'https://example.com/one',
+      title: 'First result',
+      snippet: 'Relevant excerpt.',
+      publishedAt: '2026-08-16',
+    }],
+    truncated: false,
+  })
+
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0].url, CODEX_SEARCH_URL)
+  assert.equal(requests[0].init.method, 'POST')
+  assert.equal(requests[0].init.redirect, 'error')
+  assert.equal(requests[0].init.signal, signal)
+  const headers = new Headers(requests[0].init.headers)
+  assert.equal(headers.get('authorization'), 'Bearer access-secret')
+  assert.equal(headers.get('chatgpt-account-id'), 'account-local')
+  assert.equal(headers.get('content-type'), 'application/json')
+  assert.equal(headers.get('accept'), 'application/json')
+  assert.equal(headers.get('originator'), 'pi')
+  const { version } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  assert.equal(headers.get('user-agent'), `dsh-codex-subscription/${version}`)
+  assert.deepEqual(JSON.parse(requests[0].init.body), {
+    id: 'session-local',
+    model: 'gpt-5.6-luna',
+    input: 'current result',
+    commands: {
+      search_query: [{ q: 'current result' }],
+      response_length: 'short',
+    },
+    settings: {
+      allowed_callers: ['direct'],
+      external_web_access: true,
+    },
+    max_output_tokens: 4096,
+  })
+  assert.doesNotMatch(requests[0].url, /api\.openai\.com/u)
+  assert.doesNotMatch(requests[0].init.body, /access-secret|account-local/u)
+})
+
+test('Codex search safely supports concurrent provider calls across supported DSH releases', async () => {
+  const pending = []
+  const provider = createCodexSearchProvider({
+    async getAuth() { return { auth: { apiKey: 'access-secret' } } },
+    async readCredential() { return { type: 'oauth', accountId: 'account-local' } },
+    async fetch(_url, init) {
+      const query = JSON.parse(init.body).input
+      await new Promise(resolve => pending.push(resolve))
+      return new Response(JSON.stringify({
+        results: [{ url: `https://example.com/${query}`, title: query }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    },
+  })
+
+  const searches = [
+    provider.search({ query: 'one', maxResults: 8 }),
+    provider.search({ query: 'two', maxResults: 8 }),
+    provider.search({ query: 'three', maxResults: 8 }),
+    provider.search({ query: 'four', maxResults: 8 }),
+  ]
+  while (pending.length < searches.length) await new Promise(resolve => setImmediate(resolve))
+  for (const resolve of pending) resolve()
+
+  const results = await Promise.all(searches)
+  assert.deepEqual(results.map(result => result.sources[0].title), ['one', 'two', 'three', 'four'])
+})
+
+test('Codex search drops the raw endpoint dump and preserves full structured source copy', async () => {
+  const provider = createCodexSearchProvider({
+    async getAuth() { return { auth: { apiKey: 'access-secret' } } },
+    async readCredential() { return { type: 'oauth', accountId: 'account-local' } },
+    async fetch() {
+      return new Response(JSON.stringify({
+        output: `raw-search-dump\n${'x'.repeat(20_000)}`,
+        results: [{
+          url: `https://example.com/${'encoded-'.repeat(200)}`,
+          title: 'T'.repeat(500),
+          snippet: 'S'.repeat(2_000),
+        }, {
+          url: `https://fallback.example/${'encoded-'.repeat(200)}`,
+          snippet: 'Fallback title.',
+        }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    },
+  })
+
+  const result = await provider.search({ query: 'current result', maxResults: 8 })
+  assert.equal('content' in result, false)
+  assert.equal(result.sources[0].title, 'T'.repeat(500))
+  assert.equal(result.sources[0].snippet, 'S'.repeat(2_000))
+  assert.equal(result.sources[1].title, 'fallback.example')
+})
+
+test('Codex search fails closed when the subscription is signed out', async () => {
+  let fetchCalls = 0
+  const provider = createCodexSearchProvider({
+    async getAuth() { return undefined },
+    async readCredential() { return undefined },
+    async fetch() {
+      fetchCalls += 1
+      throw new Error('must not run')
+    },
+  })
+
+  await assert.rejects(
+    provider.search({ query: 'current result', maxResults: 8 }),
+    error => error?.code === 'WEB_PROVIDER_CREDENTIAL_MISSING'
+      && error.message === 'ChatGPT subscription is not signed in',
+  )
+  assert.equal(fetchCalls, 0)
+})
+
+test('Codex search reports subscription, provider, and cancellation failures without fallback', async () => {
+  const authed = fetchSearch => createCodexSearchProvider({
+    async getAuth() { return { auth: { apiKey: 'access-secret' } } },
+    async readCredential() { return { type: 'oauth', accountId: 'account-local' } },
+    resolveModel: () => 'gpt-5.6-luna',
+    resolveSessionId: () => 'session-local',
+    fetch: fetchSearch,
+  })
+
+  for (const [response, code, message] of [
+    [new Response('', { status: 401 }), 'WEB_PROVIDER_CREDENTIAL_MISSING', 'ChatGPT sign-in needs to be renewed'],
+    [new Response('', { status: 503 }), 'WEB_PROVIDER_ERROR', 'Codex search request failed (HTTP 503)'],
+  ]) {
+    let calls = 0
+    const provider = authed(async (url) => {
+      calls += 1
+      assert.equal(url, CODEX_SEARCH_URL)
+      return response
+    })
+    await assert.rejects(
+      provider.search({ query: 'current result', maxResults: 8 }),
+      error => error?.code === code && error.message === message,
+    )
+    assert.equal(calls, 1)
+  }
+
+  const aborted = authed(async () => {
+    throw new DOMException('cancelled', 'AbortError')
+  })
+  await assert.rejects(
+    aborted.search({ query: 'current result', maxResults: 8 }),
+    error => error?.code === 'WEB_ABORTED' && error.message === 'Codex search aborted',
+  )
+})
