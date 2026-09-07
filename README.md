@@ -8,7 +8,7 @@
 
 No OpenAI API key or Codex CLI. Models, search, quota, and image generation stay inside DSH.
 
-[![npm](https://img.shields.io/npm/v/@mamdouh-aboammar/dsh-codex-subscription?logo=npm&label=npm)](https://www.npmjs.com/package/@mamdouh-aboammar/dsh-codex-subscription)
+[![npm](https://img.shields.io/npm/v/dsh-codex-subscription-en?logo=npm&label=npm)](https://www.npmjs.com/package/dsh-codex-subscription-en)
 [![MIT](https://img.shields.io/badge/license-MIT-111111.svg)](LICENSE)
 [![GitHub](https://img.shields.io/badge/GitHub-imMamdouhaboammar%2Fdsh--codex--subscription-blue?logo=github)](https://github.com/imMamdouhaboammar/dsh-codex-subscription)
 
@@ -25,7 +25,7 @@ No OpenAI API key or Codex CLI. Models, search, quota, and image generation stay
 1. **Install the plugin.** Run the standard DSH bundle command:
 
    ```sh
-   dsh plugin --profile web add @mamdouh-aboammar/dsh-codex-subscription
+   dsh plugin --profile web add dsh-codex-subscription-en
    ```
 
 2. **Sign in.** Restart DSH yourself, open **Settings -> Codex**, and choose browser sign-in. No Codex CLI and no pasted token are required.

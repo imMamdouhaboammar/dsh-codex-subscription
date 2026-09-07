@@ -1,5 +1,5 @@
 {
-  "name": "@mamdouh-aboammar/dsh-codex-subscription",
+  "name": "dsh-codex-subscription-en",
   "version": "1.0.0",
   "packageManager": "pnpm@11.19.0",
   "description": "Use ChatGPT and Codex subscriptions in DeepSeek Harness with OAuth, quota, safe resets, web search, images, and Fast mode",

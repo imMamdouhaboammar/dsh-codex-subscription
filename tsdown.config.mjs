@@ -41,8 +41,9 @@ export default defineConfig([
   const factory = (require) => {`,
       footer: `    return module.exports;
   };
-  window.__ModuleLoader__.load({ id: ${JSON.stringify(id)}, factory });
-  window.__ModuleLoader__.load({ id: ${JSON.stringify(legacyId)}, factory });
+  window.__ModuleLoader__.load({ id: "dsh-codex-subscription-en", factory });
+  window.__ModuleLoader__.load({ id: "@mamdouh-aboammar/dsh-codex-subscription", factory });
+  window.__ModuleLoader__.load({ id: "dsh-codex-subscription", factory });
 })();`,
       intro: 'var module = { exports: {} }; var exports = module.exports;',
     },
